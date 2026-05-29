@@ -31,6 +31,99 @@ pub struct AircraftUpdate {
     pub remove: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AircraftCharacteristic {
+    pub icao_code: String,
+    pub manufacturer: String,
+    pub model_faa: String,
+    pub model_bada: String,
+    pub engine_type: String, // jet, turboprop, piston, unknown
+    pub num_engines: i32,
+    pub wtc: String,        // Medium, Heavy, Super, Light
+    pub class: String,      // Fixed-wing, Helicopter, Glider, etc.
+}
+
+pub struct CharacteristicsDatabase {
+    pub characteristics: HashMap<String, AircraftCharacteristic>,
+}
+
+impl CharacteristicsDatabase {
+    pub fn load_from_csv<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+        let file = File::open(path)?;
+        let mut reader = csv::Reader::from_reader(file);
+        let mut map = HashMap::new();
+        
+        let headers = reader.headers()?.clone();
+        
+        let icao_idx = headers.iter().position(|h| h == "ICAO_Code");
+        let mfg_idx = headers.iter().position(|h| h == "Manufacturer");
+        let model_faa_idx = headers.iter().position(|h| h == "Model_FAA");
+        let model_bada_idx = headers.iter().position(|h| h == "Model_BADA");
+        let engine_type_idx = headers.iter().position(|h| h == "Physical_Class_Engine");
+        let num_engines_idx = headers.iter().position(|h| h == "Num_Engines");
+        let wtc_idx = headers.iter().position(|h| h == "ICAO_WTC");
+        let class_idx = headers.iter().position(|h| h == "Class");
+
+        if let (Some(icao_i), Some(mfg_i), Some(model_faa_i), Some(model_bada_i), Some(engine_type_i), Some(num_engines_i), Some(wtc_i), Some(class_i)) = 
+            (icao_idx, mfg_idx, model_faa_idx, model_bada_idx, engine_type_idx, num_engines_idx, wtc_idx, class_idx) {
+            for result in reader.records() {
+                if let Ok(record) = result {
+                    if let Some(icao) = record.get(icao_i) {
+                        let icao_upper = icao.to_uppercase();
+                        let manufacturer = record.get(mfg_i).unwrap_or("").trim().to_string();
+                        let model_faa = record.get(model_faa_i).unwrap_or("").trim().to_string();
+                        let model_bada = record.get(model_bada_i).unwrap_or("").trim().to_string();
+                        let engine_type = record.get(engine_type_i).unwrap_or("").trim().to_lowercase();
+                        let num_engines = record.get(num_engines_i).unwrap_or("0").parse::<i32>().unwrap_or(0);
+                        let wtc = record.get(wtc_i).unwrap_or("").trim().to_string();
+                        let class = record.get(class_i).unwrap_or("").trim().to_string();
+                        
+                        map.insert(icao_upper.clone(), AircraftCharacteristic {
+                            icao_code: icao_upper,
+                            manufacturer,
+                            model_faa,
+                            model_bada,
+                            engine_type,
+                            num_engines,
+                            wtc,
+                            class,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Self { characteristics: map })
+    }
+}
+
+fn calculate_similarity_score(a: &AircraftCharacteristic, b: &AircraftCharacteristic) -> i32 {
+    let mut score = 0;
+    
+    if a.class.to_lowercase() == b.class.to_lowercase() {
+        score += 100;
+    }
+    
+    if !a.manufacturer.is_empty() && !b.manufacturer.is_empty() && a.manufacturer.eq_ignore_ascii_case(&b.manufacturer) {
+        score += 20;
+    }
+    
+    if a.engine_type.to_lowercase() == b.engine_type.to_lowercase() {
+        score += 50;
+    }
+    
+    if a.wtc.to_lowercase() == b.wtc.to_lowercase() {
+        score += 30;
+    }
+    
+    if a.num_engines == b.num_engines {
+        score += 10;
+    } else if (a.num_engines - b.num_engines).abs() == 1 {
+        score += 5;
+    }
+    
+    score
+}
+
 pub struct CslModel {
     pub model_id: String,
     pub obj_path: String, // Path relative to X-Plane system path
@@ -55,6 +148,7 @@ pub struct PluginState {
     pub object_cache: HashMap<String, xplm_sys::XPLMObjectRef>,
     pub csl_db: CslDatabase,
     pub system_path: String,
+    pub chars_db: Option<CharacteristicsDatabase>,
 }
 
 // Retrieves the X-Plane system path
@@ -235,7 +329,7 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
     }
 
     // Lookup best model
-    let model_id_opt = match (&update.icao, &update.airline, &update.livery) {
+    let mut model_id_opt = match (&update.icao, &update.airline, &update.livery) {
         (icao, Some(airline), Some(livery)) => {
             state.csl_db.livery_map.get(&(icao.to_uppercase(), airline.to_uppercase(), livery.to_uppercase()))
                 .or_else(|| state.csl_db.airline_map.get(&(icao.to_uppercase(), airline.to_uppercase())))
@@ -252,10 +346,39 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
         (icao, None, None) => {
             state.csl_db.icao_map.get(&icao.to_uppercase())
         }
-    };
+    }.cloned();
+
+    // Similarity matching via characteristics DB if exact ICAO is not present
+    if model_id_opt.is_none() {
+        let icao_upper = update.icao.to_uppercase();
+        if let Some(ref chars_db) = state.chars_db {
+            if let Some(r_char) = chars_db.characteristics.get(&icao_upper) {
+                let mut best_score = -1;
+                let mut best_icao = None;
+                for available_icao in state.csl_db.icao_map.keys() {
+                    if let Some(l_char) = chars_db.characteristics.get(available_icao) {
+                        let score = calculate_similarity_score(r_char, l_char);
+                        if score > best_score {
+                            best_score = score;
+                            best_icao = Some(available_icao.clone());
+                        }
+                    }
+                }
+                if let Some(ref b_icao) = best_icao {
+                    if best_score >= 100 { // Share at least some basic class traits
+                        model_id_opt = state.csl_db.icao_map.get(b_icao).cloned();
+                        xplane_log(&format!(
+                            "Similarity match: requested ICAO '{}' matched to available '{}' (score: {})",
+                            icao_upper, b_icao, best_score
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
     let model_id = match model_id_opt {
-        Some(id) => id.clone(),
+        Some(id) => id,
         None => {
             let icao_upper = update.icao.to_uppercase();
             let mut matched_id = None;
@@ -422,7 +545,8 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
         };
 
         // Scan the plugin's own CSL folder
-        if let Some(plugin_dir) = get_plugin_directory() {
+        let plugin_dir_opt = get_plugin_directory();
+        if let Some(ref plugin_dir) = plugin_dir_opt {
             xplane_log(&format!("Plugin base directory: {}", plugin_dir));
             let plugin_csl = format!("{}/CSL", plugin_dir);
             xplane_log(&format!("Scanning plugin CSL: {}", plugin_csl));
@@ -441,6 +565,22 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
             csl_db.airline_map.len(),
             csl_db.icao_map.len()
         ));
+
+        // Load aircraft-characteristics.csv database
+        let mut chars_db = None;
+        if let Some(ref plugin_dir) = plugin_dir_opt {
+            let chars_path = format!("{}/aircraft-characteristics.csv", plugin_dir);
+            xplane_log(&format!("Loading aircraft characteristics from: {}", chars_path));
+            match CharacteristicsDatabase::load_from_csv(&chars_path) {
+                Ok(db) => {
+                    xplane_log(&format!("Successfully loaded {} aircraft characteristics definitions.", db.characteristics.len()));
+                    chars_db = Some(db);
+                }
+                Err(e) => {
+                    xplane_log(&format!("Warning: Failed to load aircraft characteristics: {}", e));
+                }
+            }
+        }
 
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -478,6 +618,7 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
             object_cache: HashMap::new(),
             csl_db,
             system_path,
+            chars_db,
         });
         let state_ptr = Box::into_raw(state);
 
