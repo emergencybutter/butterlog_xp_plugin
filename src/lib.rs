@@ -245,8 +245,8 @@ fn parse_xsb_aircraft(file_path: &Path, system_path: &str, db: &mut CslDatabase)
             "OBJ8" => {
                 if let Some(ref model_id) = current_model_id {
                     if tokens.len() >= 4 {
-                        let rel_obj_path = tokens[3];
-                        let abs_obj_path = parent_dir.join(rel_obj_path);
+                        let rel_obj_path = tokens[3].replace(':', "/");
+                        let abs_obj_path = parent_dir.join(&rel_obj_path);
                         
                         let rel_path_str = if let Ok(canon_obj) = abs_obj_path.canonicalize() {
                             let system_path_canon = Path::new(system_path).canonicalize().unwrap_or_else(|_| Path::new(system_path).to_path_buf());
