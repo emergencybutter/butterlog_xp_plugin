@@ -140,6 +140,7 @@ pub struct ActiveAircraft {
     pub instance: xplm_sys::XPLMInstanceRef,
     pub object: xplm_sys::XPLMObjectRef,
     pub last_updated: std::time::Instant,
+    pub last_logged_update: std::time::Instant,
 }
 
 pub struct PluginState {
@@ -449,6 +450,9 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
         roll: update.roll,
     };
 
+    let now = std::time::Instant::now();
+    let mut should_log_pos = false;
+
     if let Some(aircraft) = state.active_aircraft.get_mut(&update.id) {
         // Recreate instance if model changed
         if aircraft.object != object_ref {
@@ -466,7 +470,11 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
         unsafe {
             xplm_sys::XPLMInstanceSetPosition(aircraft.instance, &draw_info, std::ptr::null());
         }
-        aircraft.last_updated = std::time::Instant::now();
+        aircraft.last_updated = now;
+        if now.duration_since(aircraft.last_logged_update).as_secs() >= 10 {
+            aircraft.last_logged_update = now;
+            should_log_pos = true;
+        }
     } else {
         // Create new instance
         let instance = unsafe { xplm_sys::XPLMCreateInstance(object_ref, std::ptr::null_mut()) };
@@ -483,9 +491,18 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
             ActiveAircraft {
                 instance,
                 object: object_ref,
-                last_updated: std::time::Instant::now(),
+                last_updated: now,
+                last_logged_update: now,
             },
         );
+        should_log_pos = true;
+    }
+
+    if should_log_pos {
+        xplane_log(&format!(
+            "Received UDP update for proxy aircraft {}: Lat={:.6}, Lon={:.6}, Alt={:.1}m MSL, Hdg={:.1}",
+            update.id, update.latitude, update.longitude, update.elevation, update.heading
+        ));
     }
 }
 
