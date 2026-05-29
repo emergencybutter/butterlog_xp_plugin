@@ -556,6 +556,11 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
         xplane_log(&format!("Scanning global CSL: {}", global_csl));
         scan_csl_dir(&global_csl, &system_path, &mut csl_db);
 
+        // Scan IVAO CSL folder (commonly used plugin)
+        let ivao_csl = format!("{}Resources/plugins/IVAO_CSL/CSL", system_path);
+        xplane_log(&format!("Scanning IVAO CSL: {}", ivao_csl));
+        scan_csl_dir(&ivao_csl, &system_path, &mut csl_db);
+
         xplane_log(&format!(
             "CSL Database initialized with: {} models, {} livery maps, {} airline maps, {} ICAO maps",
             csl_db.models.len(),
