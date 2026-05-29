@@ -206,6 +206,33 @@ fn scan_csl_dir(csl_path: &str, system_path: &str, db: &mut CslDatabase) {
     }
 }
 
+fn resolve_obj_path(parent_dir: &Path, rel_path: &str) -> std::path::PathBuf {
+    let cleaned_path = rel_path.replace(':', "/");
+    let try_direct = parent_dir.join(&cleaned_path);
+    if try_direct.exists() {
+        return try_direct;
+    }
+
+    if let Some(pos) = cleaned_path.find('/') {
+        let first_part = &cleaned_path[..pos];
+        let rest = &cleaned_path[pos + 1..];
+        
+        if parent_dir.ends_with(first_part) {
+            let try_stripped = parent_dir.join(rest);
+            if try_stripped.exists() {
+                return try_stripped;
+            }
+        }
+        
+        let try_stripped_general = parent_dir.join(rest);
+        if try_stripped_general.exists() {
+            return try_stripped_general;
+        }
+    }
+
+    try_direct
+}
+
 // Parses a single xsb_aircraft.txt CSL package file
 fn parse_xsb_aircraft(file_path: &Path, system_path: &str, db: &mut CslDatabase) {
     let file = match File::open(file_path) {
@@ -245,8 +272,7 @@ fn parse_xsb_aircraft(file_path: &Path, system_path: &str, db: &mut CslDatabase)
             "OBJ8" => {
                 if let Some(ref model_id) = current_model_id {
                     if tokens.len() >= 4 {
-                        let rel_obj_path = tokens[3].replace(':', "/");
-                        let abs_obj_path = parent_dir.join(&rel_obj_path);
+                        let abs_obj_path = resolve_obj_path(parent_dir, tokens[3]);
                         
                         let rel_path_str = if let Ok(canon_obj) = abs_obj_path.canonicalize() {
                             let system_path_canon = Path::new(system_path).canonicalize().unwrap_or_else(|_| Path::new(system_path).to_path_buf());
