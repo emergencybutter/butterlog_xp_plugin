@@ -365,13 +365,11 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
                     }
                 }
                 if let Some(ref b_icao) = best_icao {
-                    if best_score >= 100 { // Share at least some basic class traits
-                        model_id_opt = state.csl_db.icao_map.get(b_icao).cloned();
-                        xplane_log(&format!(
-                            "Similarity match: requested ICAO '{}' matched to available '{}' (score: {})",
-                            icao_upper, b_icao, best_score
-                        ));
-                    }
+                    model_id_opt = state.csl_db.icao_map.get(b_icao).cloned();
+                    xplane_log(&format!(
+                        "Similarity match: requested ICAO '{}' matched to available '{}' (score: {})",
+                        icao_upper, b_icao, best_score
+                    ));
                 }
             }
         }
