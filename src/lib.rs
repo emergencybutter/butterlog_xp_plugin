@@ -271,6 +271,7 @@ fn parse_xsb_aircraft(file_path: &Path, system_path: &str, db: &mut CslDatabase)
                             }
                         };
 
+                        xplane_log(&format!("Discovered CSL model: {} -> {}", model_id, rel_path_str));
                         db.models.insert(
                             model_id.clone(),
                             CslModel {
