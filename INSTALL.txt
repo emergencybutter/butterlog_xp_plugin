@@ -1,0 +1,10 @@
+1. Create a folder named `butterlog_xp_plugin` inside your X-Plane installation directory:
+   `X-Plane 12/Resources/plugins/butterlog_xp_plugin/`
+2. Inside that directory, create a `64` subfolder:
+   `X-Plane 12/Resources/plugins/butterlog_xp_plugin/64/`
+3. Copy the plugin library `win.xpl`
+
+
+The plugin will use CSL models can be loaded from two paths:
+   - The plugin's own CSL folder: `X-Plane 12/Resources/plugins/butterlog_xp_plugin/CSL/`
+   - X-Plane's global CSL folder: `X-Plane 12/Resources/CSL/`
