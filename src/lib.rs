@@ -28,6 +28,9 @@ pub struct AircraftUpdate {
     pub pitch: f32,
     pub heading: f32,
     pub roll: f32,
+    /// Whether the aircraft is on the ground. Absent from older app versions
+    /// (deserializes to `None`).
+    pub on_ground: Option<bool>,
     pub remove: Option<bool>,
 }
 
@@ -150,6 +153,27 @@ pub struct PluginState {
     pub csl_db: CslDatabase,
     pub system_path: String,
     pub chars_db: Option<CharacteristicsDatabase>,
+    /// Reusable terrain probe for ground-clamping on-ground aircraft. Must only be used
+    /// from the main thread (the flight-loop callback).
+    pub terrain_probe: xplm_sys::XPLMProbeRef,
+}
+
+/// Probe the terrain Y (local OpenGL vertical) directly below/above the given local point.
+/// Returns `None` if the probe didn't hit terrain. Main thread only.
+fn probe_terrain_y(probe: xplm_sys::XPLMProbeRef, x: f32, y: f32, z: f32) -> Option<f32> {
+    if probe.is_null() {
+        return None;
+    }
+    let mut info = xplm_sys::XPLMProbeInfo_t {
+        structSize: std::mem::size_of::<xplm_sys::XPLMProbeInfo_t>() as std::os::raw::c_int,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let result = unsafe { xplm_sys::XPLMProbeTerrainXYZ(probe, x, y, z, &mut info) };
+    if result == xplm_sys::xplm_ProbeHitTerrain as xplm_sys::XPLMProbeResult {
+        Some(info.locationY)
+    } else {
+        None
+    }
 }
 
 // Retrieves the X-Plane system path
@@ -467,6 +491,19 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
         );
     }
 
+    // When the peer reports it is on the ground, clamp the vertical position to the local
+    // terrain instead of trusting the transmitted MSL altitude: the sender's MSL and the
+    // receiver's terrain mesh rarely agree exactly, which otherwise leaves the aircraft
+    // floating above or sunk into the runway. CSL model origins sit at the gear contact
+    // point, so placing the origin on the terrain surface seats the aircraft correctly.
+    let y = if update.on_ground == Some(true) {
+        probe_terrain_y(state.terrain_probe, x as f32, y as f32, z as f32)
+            .map(|ty| ty as f64)
+            .unwrap_or(y)
+    } else {
+        y
+    };
+
     let draw_info = xplm_sys::XPLMDrawInfo_t {
         structSize: std::mem::size_of::<xplm_sys::XPLMDrawInfo_t>() as i32,
         x: x as f32,
@@ -527,8 +564,8 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
 
     if should_log_pos {
         xplane_log(&format!(
-            "Received UDP update for proxy aircraft {}: Lat={:.6}, Lon={:.6}, Alt={:.1}m MSL, Hdg={:.1}",
-            update.id, update.latitude, update.longitude, update.elevation, update.heading
+            "Received UDP update for proxy aircraft {}: Lat={:.6}, Lon={:.6}, Alt={:.1}m MSL, Hdg={:.1}, OnGround={:?}",
+            update.id, update.latitude, update.longitude, update.elevation, update.heading, update.on_ground
         ));
     }
 }
@@ -659,6 +696,10 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
             }
         });
 
+        let terrain_probe = unsafe {
+            xplm_sys::XPLMCreateProbe(xplm_sys::xplm_ProbeY as xplm_sys::XPLMProbeType)
+        };
+
         let state = Box::new(PluginState {
             rx,
             active_aircraft: HashMap::new(),
@@ -666,6 +707,7 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
             csl_db,
             system_path,
             chars_db,
+            terrain_probe,
         });
         let state_ptr = Box::into_raw(state);
 
@@ -712,6 +754,10 @@ impl Drop for ButterlogXpPlugin {
             for (path, &object) in &state.object_cache {
                 xplm_sys::XPLMUnloadObject(object);
                 xplane_log(&format!("Unloaded object: {}", path));
+            }
+
+            if !state.terrain_probe.is_null() {
+                xplm_sys::XPLMDestroyProbe(state.terrain_probe);
             }
         }
         xplane_log("Plugin stopped and resources released.");
