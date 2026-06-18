@@ -1,6 +1,6 @@
 [package]
 name = "butterlog_xp_plugin"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "X-Plane 12 plugin for Butterlog to proxy multiplayer aircraft via UDP"
 
