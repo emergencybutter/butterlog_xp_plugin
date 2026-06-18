@@ -8,9 +8,15 @@ use serde::{Deserialize, Serialize};
 
 // Animation datarefs registered on each instanced CSL model so X-Plane animates
 // them. CSL models (Bluebell/XCSL) read the `libxplanemp/controls/*` family.
-// Currently just the landing gear; extend the array (and the values passed to
-// XPLMInstanceSetPosition) to drive flaps/lights/etc.
-const INSTANCE_DATAREFS: &[&[u8]] = &[b"libxplanemp/controls/gear_ratio\0"];
+// Order here must match the `dref_vals` array built in the update handler below.
+const INSTANCE_DATAREFS: &[&[u8]] = &[
+    b"libxplanemp/controls/gear_ratio\0",
+    b"libxplanemp/controls/nav_lites_on\0",
+    b"libxplanemp/controls/beacon_lites_on\0",
+    b"libxplanemp/controls/strobe_lites_on\0",
+    b"libxplanemp/controls/taxi_lites_on\0",
+    b"libxplanemp/controls/landing_lites_on\0",
+];
 
 // Standard XPLM debug log utility
 fn xplane_log(msg: &str) {
@@ -41,6 +47,17 @@ pub struct AircraftUpdate {
     /// versions (`None`), in which case we fall back to the on-ground flag.
     #[serde(default)]
     pub gear_ratio: Option<f32>,
+    /// Exterior light states (0/1). Absent from older app versions (`None` → off).
+    #[serde(default)]
+    pub nav_lights: Option<f32>,
+    #[serde(default)]
+    pub beacon_lights: Option<f32>,
+    #[serde(default)]
+    pub strobe_lights: Option<f32>,
+    #[serde(default)]
+    pub taxi_lights: Option<f32>,
+    #[serde(default)]
+    pub landing_lights: Option<f32>,
     pub remove: Option<bool>,
 }
 
@@ -542,15 +559,28 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
     // Animation datarefs to drive on the instance: gear down when on the ground,
     // up otherwise. Names are registered at XPLMCreateInstance (null-terminated);
     // values are fed every frame to XPLMInstanceSetPosition (same order/length).
-    let dref_names: [*const c_char; 2] =
-        [INSTANCE_DATAREFS[0].as_ptr() as *const c_char, std::ptr::null()];
+    // Null-terminated dataref name list for XPLMCreateInstance (kept alive for the
+    // duration of the create call).
+    let mut dref_ptrs: Vec<*const c_char> =
+        INSTANCE_DATAREFS.iter().map(|d| d.as_ptr() as *const c_char).collect();
+    dref_ptrs.push(std::ptr::null());
+
     // Prefer the sender's real gear ratio; otherwise fall back to the on-ground
-    // flag (covers senders that don't report gear, e.g. MSFS or older clients).
+    // flag (covers senders that don't report gear, e.g. older clients).
     let gear = match update.gear_ratio {
         Some(g) if g > 0.0 => g.clamp(0.0, 1.0),
         _ => if update.on_ground == Some(true) { 1.0 } else { 0.0 },
     };
-    let dref_vals: [f32; 1] = [gear];
+    let light = |v: Option<f32>| if v.unwrap_or(0.0) > 0.5 { 1.0f32 } else { 0.0f32 };
+    // Order must match INSTANCE_DATAREFS.
+    let dref_vals: [f32; 6] = [
+        gear,
+        light(update.nav_lights),
+        light(update.beacon_lights),
+        light(update.strobe_lights),
+        light(update.taxi_lights),
+        light(update.landing_lights),
+    ];
 
     let now = std::time::Instant::now();
     let mut should_log_pos = false;
@@ -561,7 +591,7 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
             unsafe {
                 xplm_sys::XPLMDestroyInstance(aircraft.instance);
             }
-            let instance = unsafe { xplm_sys::XPLMCreateInstance(object_ref, dref_names.as_ptr() as *mut *const c_char) };
+            let instance = unsafe { xplm_sys::XPLMCreateInstance(object_ref, dref_ptrs.as_ptr() as *mut *const c_char) };
             if instance.is_null() {
                 state.active_aircraft.remove(&update.id);
                 return;
@@ -579,7 +609,7 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
         }
     } else {
         // Create new instance
-        let instance = unsafe { xplm_sys::XPLMCreateInstance(object_ref, dref_names.as_ptr() as *mut *const c_char) };
+        let instance = unsafe { xplm_sys::XPLMCreateInstance(object_ref, dref_ptrs.as_ptr() as *mut *const c_char) };
         if instance.is_null() {
             xplane_log(&format!("ERROR: Failed to create instance for: {}", update.id));
             return;
