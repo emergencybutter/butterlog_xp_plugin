@@ -1,1 +1,4 @@
 target/
+
+# Packaged plugin archives (build artifacts of build-xp-plugin-zip.ps1)
+*.zip
