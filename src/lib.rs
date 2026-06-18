@@ -6,6 +6,12 @@ use std::os::raw::c_char;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 
+// Animation datarefs registered on each instanced CSL model so X-Plane animates
+// them. CSL models (Bluebell/XCSL) read the `libxplanemp/controls/*` family.
+// Currently just the landing gear; extend the array (and the values passed to
+// XPLMInstanceSetPosition) to drive flaps/lights/etc.
+const INSTANCE_DATAREFS: &[&[u8]] = &[b"libxplanemp/controls/gear_ratio\0"];
+
 // Standard XPLM debug log utility
 fn xplane_log(msg: &str) {
     let formatted = format!("[ButterlogXP] {}\n", msg);
@@ -31,6 +37,10 @@ pub struct AircraftUpdate {
     /// Whether the aircraft is on the ground. Absent from older app versions
     /// (deserializes to `None`).
     pub on_ground: Option<bool>,
+    /// Landing-gear deployment 0.0..=1.0 from the sender. Absent from older app
+    /// versions (`None`), in which case we fall back to the on-ground flag.
+    #[serde(default)]
+    pub gear_ratio: Option<f32>,
     pub remove: Option<bool>,
 }
 
@@ -130,6 +140,8 @@ fn calculate_similarity_score(a: &AircraftCharacteristic, b: &AircraftCharacteri
 pub struct CslModel {
     pub model_id: String,
     pub obj_path: String, // Path relative to X-Plane system path
+    /// Meters to raise the model so its wheels sit on the ground (CSL VERT_OFFSET).
+    pub vert_offset: f32,
 }
 
 pub struct CslDatabase {
@@ -327,8 +339,20 @@ fn parse_xsb_aircraft(file_path: &Path, system_path: &str, db: &mut CslDatabase)
                             CslModel {
                                 model_id: model_id.clone(),
                                 obj_path: rel_path_str,
+                                vert_offset: 0.0,
                             },
                         );
+                    }
+                }
+            }
+            "VERT_OFFSET" => {
+                // Meters to raise the model so its wheels touch the ground. Appears
+                // after the model's OBJ8 line, so the model is already in db.models.
+                if let Some(ref model_id) = current_model_id {
+                    if let Some(v) = tokens.get(1).and_then(|t| t.parse::<f32>().ok()) {
+                        if let Some(m) = db.models.get_mut(model_id) {
+                            m.vert_offset = v;
+                        }
                     }
                 }
             }
@@ -458,6 +482,7 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
         None => return,
     };
 
+    let vert_offset = csl_model.vert_offset as f64;
     let obj_path = &csl_model.obj_path;
     let object_ref = if let Some(&obj) = state.object_cache.get(obj_path) {
         obj
@@ -494,11 +519,11 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
     // When the peer reports it is on the ground, clamp the vertical position to the local
     // terrain instead of trusting the transmitted MSL altitude: the sender's MSL and the
     // receiver's terrain mesh rarely agree exactly, which otherwise leaves the aircraft
-    // floating above or sunk into the runway. CSL model origins sit at the gear contact
-    // point, so placing the origin on the terrain surface seats the aircraft correctly.
+    // floating above or sunk into the runway. Add the model's VERT_OFFSET (origin-to-wheel
+    // distance) so it sits exactly on the surface rather than the origin being buried.
     let y = if update.on_ground == Some(true) {
         probe_terrain_y(state.terrain_probe, x as f32, y as f32, z as f32)
-            .map(|ty| ty as f64)
+            .map(|ty| ty as f64 + vert_offset)
             .unwrap_or(y)
     } else {
         y
@@ -514,6 +539,19 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
         roll: update.roll,
     };
 
+    // Animation datarefs to drive on the instance: gear down when on the ground,
+    // up otherwise. Names are registered at XPLMCreateInstance (null-terminated);
+    // values are fed every frame to XPLMInstanceSetPosition (same order/length).
+    let dref_names: [*const c_char; 2] =
+        [INSTANCE_DATAREFS[0].as_ptr() as *const c_char, std::ptr::null()];
+    // Prefer the sender's real gear ratio; otherwise fall back to the on-ground
+    // flag (covers senders that don't report gear, e.g. MSFS or older clients).
+    let gear = match update.gear_ratio {
+        Some(g) if g > 0.0 => g.clamp(0.0, 1.0),
+        _ => if update.on_ground == Some(true) { 1.0 } else { 0.0 },
+    };
+    let dref_vals: [f32; 1] = [gear];
+
     let now = std::time::Instant::now();
     let mut should_log_pos = false;
 
@@ -523,7 +561,7 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
             unsafe {
                 xplm_sys::XPLMDestroyInstance(aircraft.instance);
             }
-            let instance = unsafe { xplm_sys::XPLMCreateInstance(object_ref, std::ptr::null_mut()) };
+            let instance = unsafe { xplm_sys::XPLMCreateInstance(object_ref, dref_names.as_ptr() as *mut *const c_char) };
             if instance.is_null() {
                 state.active_aircraft.remove(&update.id);
                 return;
@@ -532,7 +570,7 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
             aircraft.object = object_ref;
         }
         unsafe {
-            xplm_sys::XPLMInstanceSetPosition(aircraft.instance, &draw_info, std::ptr::null());
+            xplm_sys::XPLMInstanceSetPosition(aircraft.instance, &draw_info, dref_vals.as_ptr());
         }
         aircraft.last_updated = now;
         if now.duration_since(aircraft.last_logged_update).as_secs() >= 10 {
@@ -541,13 +579,13 @@ fn process_update(state: &mut PluginState, update: AircraftUpdate) {
         }
     } else {
         // Create new instance
-        let instance = unsafe { xplm_sys::XPLMCreateInstance(object_ref, std::ptr::null_mut()) };
+        let instance = unsafe { xplm_sys::XPLMCreateInstance(object_ref, dref_names.as_ptr() as *mut *const c_char) };
         if instance.is_null() {
             xplane_log(&format!("ERROR: Failed to create instance for: {}", update.id));
             return;
         }
         unsafe {
-            xplm_sys::XPLMInstanceSetPosition(instance, &draw_info, std::ptr::null());
+            xplm_sys::XPLMInstanceSetPosition(instance, &draw_info, dref_vals.as_ptr());
         }
         xplane_log(&format!("Created aircraft instance: {} (model: {})", update.id, model_id));
         state.active_aircraft.insert(
