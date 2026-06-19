@@ -71,6 +71,21 @@ pub struct AircraftCharacteristic {
     pub num_engines: i32,
     pub wtc: String,        // Medium, Heavy, Super, Light
     pub class: String,      // Fixed-wing, Helicopter, Glider, etc.
+    pub wingspan: f64,
+}
+
+impl AircraftCharacteristic {
+    pub fn is_bizjet(&self) -> bool {
+        let mfg = self.manufacturer.to_lowercase();
+        let model = self.model_faa.to_lowercase();
+        mfg.contains("gulfstream") 
+            || mfg.contains("learjet") 
+            || mfg.contains("dassault")
+            || mfg.contains("hawker")
+            || (mfg.contains("cessna") && model.contains("citation"))
+            || (mfg.contains("bombardier") && (model.contains("global") || model.contains("challenger")))
+            || (mfg.contains("embraer") && (model.contains("phenom") || model.contains("legacy") || model.contains("praetor")))
+    }
 }
 
 pub struct CharacteristicsDatabase {
@@ -94,8 +109,10 @@ impl CharacteristicsDatabase {
         let wtc_idx = headers.iter().position(|h| h == "ICAO_WTC");
         let class_idx = headers.iter().position(|h| h == "Class");
 
-        if let (Some(icao_i), Some(mfg_i), Some(model_faa_i), Some(model_bada_i), Some(engine_type_i), Some(num_engines_i), Some(wtc_i), Some(class_i)) = 
-            (icao_idx, mfg_idx, model_faa_idx, model_bada_idx, engine_type_idx, num_engines_idx, wtc_idx, class_idx) {
+        let wingspan_idx = headers.iter().position(|h| h == "Wingspan_ft_without_winglets_sharklets");
+
+        if let (Some(icao_i), Some(mfg_i), Some(model_faa_i), Some(model_bada_i), Some(engine_type_i), Some(num_engines_i), Some(wtc_i), Some(class_i), Some(wingspan_i)) = 
+            (icao_idx, mfg_idx, model_faa_idx, model_bada_idx, engine_type_idx, num_engines_idx, wtc_idx, class_idx, wingspan_idx) {
             for result in reader.records() {
                 if let Ok(record) = result {
                     if let Some(icao) = record.get(icao_i) {
@@ -107,6 +124,7 @@ impl CharacteristicsDatabase {
                         let num_engines = record.get(num_engines_i).unwrap_or("0").parse::<i32>().unwrap_or(0);
                         let wtc = record.get(wtc_i).unwrap_or("").trim().to_string();
                         let class = record.get(class_i).unwrap_or("").trim().to_string();
+                        let wingspan = record.get(wingspan_i).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
                         
                         map.insert(icao_upper.clone(), AircraftCharacteristic {
                             icao_code: icao_upper,
@@ -117,6 +135,7 @@ impl CharacteristicsDatabase {
                             num_engines,
                             wtc,
                             class,
+                            wingspan,
                         });
                     }
                 }
@@ -149,6 +168,25 @@ fn calculate_similarity_score(a: &AircraftCharacteristic, b: &AircraftCharacteri
         score += 10;
     } else if (a.num_engines - b.num_engines).abs() == 1 {
         score += 5;
+    }
+    
+    // Categorize business jets
+    if a.is_bizjet() == b.is_bizjet() {
+        score += 50;
+    }
+
+    // Compare wingspans (proxy for size)
+    if a.wingspan > 0.0 && b.wingspan > 0.0 {
+        let diff = (a.wingspan - b.wingspan).abs();
+        let avg = (a.wingspan + b.wingspan) / 2.0;
+        let rel_diff = diff / avg;
+        if rel_diff < 0.1 {
+            score += 40;
+        } else if rel_diff < 0.25 {
+            score += 20;
+        } else if rel_diff < 0.5 {
+            score += 10;
+        }
     }
     
     score
