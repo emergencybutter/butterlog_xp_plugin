@@ -86,6 +86,55 @@ impl AircraftCharacteristic {
             || (mfg.contains("bombardier") && (model.contains("global") || model.contains("challenger")))
             || (mfg.contains("embraer") && (model.contains("phenom") || model.contains("legacy") || model.contains("praetor")))
     }
+
+    pub fn is_fighter_jet(&self) -> bool {
+        let icao = self.icao_code.to_uppercase();
+        let model = self.model_faa.to_lowercase();
+        let engine = self.engine_type.to_lowercase();
+        
+        if engine != "jet" {
+            return false;
+        }
+        
+        let is_military_icao = icao.starts_with('F') && icao.chars().nth(1).map_or(false, |c| c.is_ascii_digit())
+            || icao == "A10"
+            || icao == "T38"
+            || icao == "T45"
+            || icao == "L39"
+            || icao.starts_with("MIG")
+            || icao.starts_with("SU")
+            || icao.starts_with("MIR")
+            || icao.starts_with("EFA")
+            || icao.starts_with("JAS");
+
+        is_military_icao
+            || model.contains("f-15")
+            || model.contains("f-16")
+            || model.contains("f-18")
+            || model.contains("f-22")
+            || model.contains("f-35")
+            || model.contains("f/a-18")
+            || model.contains("fa-18")
+            || model.contains("a-10")
+            || model.contains("t-38")
+            || model.contains("l-39")
+            || model.contains("raptor")
+            || model.contains("hornet")
+            || model.contains("fighting falcon")
+            || model.contains("eagle")
+            || model.contains("phantom")
+            || model.contains("tomcat")
+            || model.contains("harrier")
+            || model.contains("talon")
+            || model.contains("albatros")
+            || model.contains("gripen")
+            || model.contains("mirage")
+            || model.contains("rafale")
+            || model.contains("eurofighter")
+            || model.contains("typhoon")
+            || model.contains("sukhoi")
+            || model.contains("mikoyan")
+    }
 }
 
 pub struct CharacteristicsDatabase {
@@ -172,6 +221,11 @@ fn calculate_similarity_score(a: &AircraftCharacteristic, b: &AircraftCharacteri
     
     // Categorize business jets
     if a.is_bizjet() == b.is_bizjet() {
+        score += 50;
+    }
+
+    // Categorize fighter jets
+    if a.is_fighter_jet() == b.is_fighter_jet() {
         score += 50;
     }
 
