@@ -7,6 +7,11 @@ description = "X-Plane 12 plugin for Butterlog to proxy multiplayer aircraft via
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Records every frame's datarefs to Output/butterlog for the sim-native telemetry
+# measurements (rollout phase 1). Not for release builds.
+capture-spike = []
+
 [dependencies]
 xplm = "0.4"
 xplm-sys = "0.4"

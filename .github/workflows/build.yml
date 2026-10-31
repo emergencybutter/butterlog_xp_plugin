@@ -23,6 +23,11 @@ jobs:
       - name: Test
         run: cargo test --release --locked
 
+      # The capture spike (sim-native telemetry rollout, phase 1) is not shipped, but must
+      # keep compiling. `check` leaves the release DLL above untouched.
+      - name: Check capture spike
+        run: cargo check --release --locked --features capture-spike
+
       - name: Package
         shell: pwsh
         run: |

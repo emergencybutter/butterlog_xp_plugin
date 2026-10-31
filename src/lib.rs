@@ -6,6 +6,9 @@ use std::os::raw::c_char;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "capture-spike")]
+mod capture;
+
 // Animation datarefs registered on each instanced CSL model so X-Plane animates
 // them. CSL models (Bluebell/XCSL) read the `libxplanemp/controls/*` family.
 // Order here must match the `dref_vals` array built in the update handler below.
@@ -277,6 +280,8 @@ pub struct PluginState {
     /// Reusable terrain probe for ground-clamping on-ground aircraft. Must only be used
     /// from the main thread (the flight-loop callback).
     pub terrain_probe: xplm_sys::XPLMProbeRef,
+    #[cfg(feature = "capture-spike")]
+    pub capture: Option<capture::Capture>,
 }
 
 /// Probe the terrain Y (local OpenGL vertical) directly below/above the given local point.
@@ -738,6 +743,18 @@ unsafe extern "C" fn flight_loop_callback(
     refcon: *mut std::os::raw::c_void,
 ) -> f32 {
     let state = &mut *(refcon as *mut PluginState);
+
+    #[cfg(feature = "capture-spike")]
+    if let Some(capture) = &mut state.capture {
+        // A panic must not unwind into X-Plane; stop capturing instead.
+        let sampled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture.sample(_counter)
+        }));
+        if sampled.is_err() {
+            xplane_log("Capture: sampling panicked; capture stopped.");
+            state.capture = None;
+        }
+    }
     
     // Dequeue and process all pending UDP updates
     while let Ok(update) = state.rx.try_recv() {
@@ -860,6 +877,9 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
             xplm_sys::XPLMCreateProbe(xplm_sys::xplm_ProbeY as xplm_sys::XPLMProbeType)
         };
 
+        #[cfg(feature = "capture-spike")]
+        let capture = capture::Capture::start(&system_path);
+
         let state = Box::new(PluginState {
             rx,
             active_aircraft: HashMap::new(),
@@ -868,6 +888,8 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
             system_path,
             chars_db,
             terrain_probe,
+            #[cfg(feature = "capture-spike")]
+            capture,
         });
         let state_ptr = Box::into_raw(state);
 
