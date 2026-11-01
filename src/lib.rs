@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "capture-spike")]
 mod capture;
+mod link;
 
 // Animation datarefs registered on each instanced CSL model so X-Plane animates
 // them. CSL models (Bluebell/XCSL) read the `libxplanemp/controls/*` family.
@@ -20,6 +21,14 @@ const INSTANCE_DATAREFS: &[&[u8]] = &[
     b"libxplanemp/controls/taxi_lites_on\0",
     b"libxplanemp/controls/landing_lites_on\0",
 ];
+
+/// The user's aircraft `.acf` path. Main thread only.
+fn user_aircraft_path() -> String {
+    let mut file = [0 as c_char; 512];
+    let mut path = [0 as c_char; 1024];
+    unsafe { xplm_sys::XPLMGetNthAircraftModel(0, file.as_mut_ptr(), path.as_mut_ptr()) };
+    unsafe { std::ffi::CStr::from_ptr(path.as_ptr()) }.to_string_lossy().into_owned()
+}
 
 // Standard XPLM debug log utility
 fn xplane_log(msg: &str) {
@@ -282,6 +291,8 @@ pub struct PluginState {
     pub terrain_probe: xplm_sys::XPLMProbeRef,
     #[cfg(feature = "capture-spike")]
     pub capture: Option<capture::Capture>,
+    /// The telemetry link to the app; `None` if it couldn't listen or it panicked.
+    pub link: Option<link::Link>,
 }
 
 /// Probe the terrain Y (local OpenGL vertical) directly below/above the given local point.
@@ -756,6 +767,14 @@ unsafe extern "C" fn flight_loop_callback(
         }
     }
     
+    if let Some(link) = &mut state.link {
+        // A panic must not unwind into X-Plane; drop the link instead.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| link.sample())).is_err() {
+            xplane_log("Telemetry link: sampling panicked; link stopped.");
+            state.link = None;
+        }
+    }
+
     // Dequeue and process all pending UDP updates
     while let Ok(update) = state.rx.try_recv() {
         process_update(state, update);
@@ -879,6 +898,7 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
 
         #[cfg(feature = "capture-spike")]
         let capture = capture::Capture::start(&system_path);
+        let link = link::Link::start(env!("CARGO_PKG_VERSION"), xplane_log);
 
         let state = Box::new(PluginState {
             rx,
@@ -890,6 +910,7 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
             terrain_probe,
             #[cfg(feature = "capture-spike")]
             capture,
+            link,
         });
         let state_ptr = Box::into_raw(state);
 
@@ -904,6 +925,22 @@ impl xplm::plugin::Plugin for ButterlogXpPlugin {
 
         xplane_log("Plugin started successfully and listening on UDP port 49020.");
         Ok(ButterlogXpPlugin { state_ptr })
+    }
+
+    /// Sim events for the telemetry link (`link::EVENT_*`). Crashes, pauses and replays the
+    /// app reads from their datarefs, in step with the frames.
+    fn receive_message(&mut self, _from: i32, message: i32, param: *mut std::os::raw::c_void) {
+        let state = unsafe { &mut *self.state_ptr };
+        let Some(link) = &mut state.link else { return };
+        // `param` is the aircraft's index; 0 is the user's.
+        let user_aircraft = param.is_null();
+        match message as u32 {
+            xplm_sys::XPLM_MSG_PLANE_LOADED if user_aircraft => {
+                link.event(link::EVENT_AIRCRAFT_LOADED, user_aircraft_path());
+            }
+            xplm_sys::XPLM_MSG_AIRPORT_LOADED => link.event(link::EVENT_AIRPORT_LOADED, String::new()),
+            _ => {}
+        }
     }
 
     fn info(&self) -> xplm::plugin::PluginInfo {

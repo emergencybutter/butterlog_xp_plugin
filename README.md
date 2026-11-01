@@ -13,6 +13,7 @@ This is a high-performance X-Plane 12 plugin written in Rust that listens to a U
   4. Partial ICAO prefix fallback (e.g. matching `B73` for `B738`)
   5. Direct fallback to any loaded model.
 - **Automatic Cleanup**: Automatically destroys instances of aircraft if no updates are received for 10 seconds, or immediately upon a `"remove": true` command.
+- **Telemetry Link**: Streams the datarefs the ButterLog app asks for, every sim frame and stamped with the sim clock, over TCP on `127.0.0.1:49021`. The app records them as sim-native telemetry (`capture: "xp_plugin"`). The protocol is described in `src/link.rs`.
 - **Low Memory Footprint**: Caches loaded `.obj` files in memory to avoid redundant file loads.
 
 ## Installation

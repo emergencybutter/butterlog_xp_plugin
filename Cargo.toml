@@ -1,8 +1,8 @@
 [package]
 name = "butterlog_xp_plugin"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
-description = "X-Plane 12 plugin for Butterlog to proxy multiplayer aircraft via UDP"
+description = "X-Plane 12 plugin for Butterlog: multiplayer aircraft over UDP, and telemetry to the app over a localhost TCP link"
 
 [lib]
 crate-type = ["cdylib"]
