@@ -1,6 +1,19 @@
-# Builds the plugin on every push and pull request, and keeps the packaged
-# win.xpl as a workflow artifact. macOS and Linux builds come later, with
-# signing and notarisation (sim-native telemetry rollout, phase 9).
+# Builds the plugin for Windows, macOS (universal: x86_64 + arm64) and Linux on every push
+# and pull request, then packages the three into one plugin folder:
+#
+#   butterlog_xp_plugin/64/win.xpl
+#   butterlog_xp_plugin/64/mac.xpl
+#   butterlog_xp_plugin/64/lin.xpl
+#   butterlog_xp_plugin/aircraft-characteristics.csv
+#
+# macOS builds are signed and notarised when the Apple secrets below are set, and left
+# unsigned otherwise (fine for testing; Gatekeeper blocks an unsigned plugin downloaded from
+# the web until it's allowed by hand).
+#
+#   APPLE_CERTIFICATE           base64 of a "Developer ID Application" .p12
+#   APPLE_CERTIFICATE_PASSWORD  its password
+#   APPLE_SIGNING_IDENTITY      e.g. "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD   for notarytool (an app-specific password)
 name: build
 
 on:
@@ -31,13 +44,138 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $dir = "dist/butterlog_xp_plugin"
-          New-Item -ItemType Directory -Path "$dir/64" -Force | Out-Null
-          Copy-Item target/release/butterlog_xp_plugin.dll "$dir/64/win.xpl"
-          Copy-Item aircraft-characteristics.csv "$dir/"
-          Copy-Item INSTALL.txt "$dir/"
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item target/release/butterlog_xp_plugin.dll dist/win.xpl
 
       - uses: actions/upload-artifact@v4
         with:
-          name: butterlog_xp_plugin-windows
+          name: win.xpl
+          path: dist/win.xpl
+
+  macos:
+    runs-on: macos-latest
+    env:
+      # X-Plane 12's minimum. arm64 starts at 11.0 whatever this says.
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      # No tests here: a test binary links the XPLM framework, which only X-Plane provides
+      # at run time. The tests are platform-independent and run on Windows and Linux.
+
+      - name: Universal binary
+        run: |
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/libbutterlog_xp_plugin.dylib \
+            target/x86_64-apple-darwin/release/libbutterlog_xp_plugin.dylib \
+            -output dist/mac.xpl
+          lipo -info dist/mac.xpl
+
+      - name: Sign and notarise
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::notice::No Apple signing secrets; mac.xpl is unsigned."
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+          codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" dist/mac.xpl
+          codesign --verify --strict --verbose=2 dist/mac.xpl
+
+          # A bare library can't be stapled; Gatekeeper finds the ticket online.
+          ditto -c -k dist/mac.xpl "$RUNNER_TEMP/mac.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/mac.zip" --wait \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac.xpl
+          path: dist/mac.xpl
+
+  linux:
+    # The oldest glibc GitHub offers, so the plugin loads on older distributions too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: libclang for bindgen
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      # X-Plane provides the XPLM symbols when it loads the plugin; anything else left
+      # undefined would fail only then, so list them here.
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/libbutterlog_xp_plugin.so dist/lin.xpl
+          echo "Undefined symbols other than XPLM, libc/libgcc and weak ones:"
+          nm -D --undefined-only dist/lin.xpl | grep -v -E ' (XPLM|XP)[A-Za-z]' \
+            | grep -v -E '@(GLIBC|GCC)_' | grep -v -E '^ +w ' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lin.xpl
+          path: dist/lin.xpl
+
+  package:
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+          merge-multiple: true
+
+      - name: Assemble
+        run: |
+          dir=dist/butterlog_xp_plugin
+          mkdir -p "$dir/64"
+          cp binaries/win.xpl binaries/mac.xpl binaries/lin.xpl "$dir/64/"
+          cp aircraft-characteristics.csv "$dir/"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "$version" > "$dir/version.txt"
+          ls -lR dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: butterlog_xp_plugin
           path: dist/butterlog_xp_plugin
