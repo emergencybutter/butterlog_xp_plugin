@@ -125,6 +125,8 @@ pub struct Capture {
     slots: Vec<Slot>,
     n_values: usize,
     sim_time: xplm_sys::XPLMDataRef,
+    /// `total_running_time_sec` is a float; `XPLMGetDatad` reads 0 from it.
+    sim_time_is_double: bool,
     tx: Option<SyncSender<Frame>>,
     writer: Option<JoinHandle<()>>,
     frames: u64,
@@ -145,6 +147,9 @@ impl Capture {
             xplane_log("Capture: sim time dataref not found; not capturing.");
             return None;
         }
+        let sim_time_is_double = unsafe { xplm_sys::XPLMGetDataRefTypes(sim_time) } as u32
+            & xplm_sys::xplmType_Double
+            != 0;
         let mut slots = Vec::new();
         let mut names = Vec::new();
         for name in DATAREFS {
@@ -232,6 +237,7 @@ impl Capture {
             slots,
             n_values,
             sim_time,
+            sim_time_is_double,
             tx: Some(tx),
             writer: Some(writer),
             frames: 0,
@@ -244,7 +250,11 @@ impl Capture {
     pub fn sample(&mut self, counter: i32) {
         let Some(tx) = &self.tx else { return };
         let mut frame = Frame {
-            sim_time: unsafe { xplm_sys::XPLMGetDatad(self.sim_time) },
+            sim_time: if self.sim_time_is_double {
+                unsafe { xplm_sys::XPLMGetDatad(self.sim_time) }
+            } else {
+                unsafe { xplm_sys::XPLMGetDataf(self.sim_time) }.into()
+            },
             wall_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as i64),
