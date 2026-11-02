@@ -456,12 +456,12 @@ fn client(
     plugin_version: &str,
     xplane_version: i32,
 ) -> std::io::Result<()> {
+    // One non-blocking socket for both directions. (A clone shares the socket, so making
+    // a clone blocking for writes made reads block too, and the subscription never got
+    // past `Inbox::fill`.)
     stream.set_nonblocking(true)?;
     stream.set_nodelay(true)?;
-    let mut writer = stream.try_clone()?;
-    writer.set_nonblocking(false)?;
-    writer.set_write_timeout(Some(Duration::from_secs(5)))?;
-    writer.write_all(&hello(plugin_version, xplane_version))?;
+    write_all(&mut stream, &hello(plugin_version, xplane_version))?;
 
     let mut inbox = Inbox::default();
     // Frames from the flight loop, for the current subscription.
@@ -502,10 +502,37 @@ fn client(
                         break;
                     }
                 }
-                writer.write_all(&batch)?;
+                write_all(&mut stream, &batch)?;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => frames = None,
+        }
+    }
+    Ok(())
+}
+
+/// How long the app may leave a write unread before the link is dropped.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `write_all` for a non-blocking stream: retries until everything is written or
+/// [`WRITE_TIMEOUT`] passes without progress.
+fn write_all(stream: &mut impl Write, mut buf: &[u8]) -> std::io::Result<()> {
+    let mut last_progress = std::time::Instant::now();
+    while !buf.is_empty() {
+        match stream.write(buf) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                buf = &buf[n..];
+                last_progress = std::time::Instant::now();
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if last_progress.elapsed() > WRITE_TIMEOUT {
+                    return Err(ErrorKind::TimedOut.into());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())
@@ -569,6 +596,53 @@ mod tests {
         assert_eq!(inbox.next().unwrap(), Some((SUBSCRIBE, vec![1, 2, 3])));
         assert_eq!(inbox.next().unwrap(), Some((SUBSCRIBE, vec![4])));
         assert_eq!(inbox.next().unwrap(), None);
+    }
+
+    /// The network thread against an app on a loopback port: hello, subscription, the flight
+    /// loop's answer and a frame, then the app closing.
+    #[test]
+    fn a_client_subscribes_and_gets_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (requests_tx, requests) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            client(stream, &requests_tx, &AtomicBool::new(false), "0.3.1", 121_400)
+        });
+
+        let mut app = TcpStream::connect(addr).unwrap();
+        app.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let read_message = |app: &mut TcpStream| {
+            let mut len = [0u8; 4];
+            app.read_exact(&mut len).unwrap();
+            let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+            app.read_exact(&mut body).unwrap();
+            body
+        };
+        assert_eq!(read_message(&mut app)[0], HELLO);
+        let mut p = 1u16.to_le_bytes().to_vec();
+        put_str(&mut p, "sim/a");
+        p.extend_from_slice(&SCALAR.to_le_bytes());
+        app.write_all(&message(SUBSCRIBE, &p)).unwrap();
+
+        // The flight loop's part.
+        let request: Request = requests.recv_timeout(Duration::from_secs(5)).expect("subscription passed on");
+        assert_eq!(request.entries, vec![("sim/a".to_string(), SCALAR)]);
+        request.tx.send(Out::Subscribed(vec![1])).unwrap();
+        let mut frame = request.spare.recv().unwrap();
+        frame.sim_time = 7.0;
+        frame.n = 1;
+        frame.values[0] = 42.0;
+        request.tx.send(Out::Frame(frame)).unwrap();
+
+        assert_eq!(read_message(&mut app), [SUBSCRIBED, 1, 0, 1]);
+        let body = read_message(&mut app);
+        assert_eq!(body[0], FRAME);
+        assert_eq!(f64::from_le_bytes(body[1..9].try_into().unwrap()), 7.0);
+        assert_eq!(f64::from_le_bytes(body[body.len() - 8..].try_into().unwrap()), 42.0);
+
+        drop(app);
+        assert!(server.join().unwrap().is_ok(), "ends cleanly when the app closes");
     }
 
     #[test]
